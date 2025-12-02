@@ -6,10 +6,13 @@ import pandas as pd
 from datetime import datetime
 import os
 import csv
-#dummychange
+import time
+
+#Welcome to our code
 # --- CONFIGURATION ---
-PAGE_TITLE = "Occupancy Monitor (Secure)"
+PAGE_TITLE = "Occupancy Monitor"
 CSV_FILE = "attendance_log.csv"
+COOLDOWN_SECONDS = 3.0  # No double counts within 3 seconds
 
 st.set_page_config(page_title=PAGE_TITLE, layout="wide")
 
@@ -22,9 +25,14 @@ if 'count_out' not in st.session_state:
     st.session_state['count_out'] = 0
 if 'recent_events' not in st.session_state:
     st.session_state['recent_events'] = []
-# Tracker State: {tracker_id: "OUTSIDE" | "BETWEEN" | "INSIDE"}
 if 'tracker_state' not in st.session_state:
     st.session_state['tracker_state'] = {}
+
+# Cooldown Timers {tracker_id: timestamp}
+if 'last_entry_time' not in st.session_state:
+    st.session_state['last_entry_time'] = {}
+if 'last_exit_time' not in st.session_state:
+    st.session_state['last_exit_time'] = {}
 
 
 def cycle_camera():
@@ -66,15 +74,23 @@ with st.sidebar:
     st.header("Control Panel")
 
     st.subheader("Video Source")
-    st.write(f"Index: {st.session_state['cam_index']}")
-    st.button("Switch Camera", on_click=cycle_camera, use_container_width=True)
+    st.write(f"Current Input: Index {st.session_state['cam_index']}")
+    st.button("Change Video Source", on_click=cycle_camera, use_container_width=True)
 
     st.divider()
 
     st.subheader("Calibration")
-    st.caption("Adjust lines to floor perspective.")
-    line_door_pct = st.slider("Door Line (White)", 0.0, 1.0, 0.50, 0.01)
-    line_room_pct = st.slider("Room Line (Green)", 0.0, 1.0, 0.85, 0.01)
+    st.caption("Move the zone up or down. The gap is fixed.")
+
+    # --- UPDATED SLIDER LOGIC ---
+    # We limit max to 0.90 so the bottom line (which is +0.10) doesn't go off screen
+    line_door_pct = st.slider("Zone Position (Top Line)", 0.0, 0.90, 0.40, 0.01)
+
+    # Automatically calculate the bottom line with a 0.10 gap
+    line_room_pct = line_door_pct + 0.10
+
+    # Visual feedback removed per request
+    # ----------------------------
 
     st.divider()
 
@@ -84,14 +100,15 @@ with st.sidebar:
     st.divider()
     if os.path.exists(CSV_FILE):
         with open(CSV_FILE, "rb") as f:
-            st.download_button("Export Log", f, file_name="attendance_log.csv", use_container_width=True)
+            st.download_button("Export CSV Log", f, file_name="attendance_log.csv", use_container_width=True)
 
+# Main Grid
 col_video, col_stats = st.columns([2, 1])
 
 with col_stats:
     st.subheader("Real-Time Metrics")
     m1, m2 = st.columns(2)
-    # PLACEHOLDERS for zero-flicker updates
+    # PLACEHOLDERS for instant updates
     in_metric = m1.empty()
     out_metric = m2.empty()
     in_metric.metric("Total Entered", st.session_state['count_in'])
@@ -121,17 +138,10 @@ def main():
 
     model = load_model()
 
-    # Tracker Config (Updated for new Supervision version)
-    tracker = sv.ByteTrack(
-        track_activation_threshold=0.5,
-        lost_track_buffer=60,
-        minimum_matching_threshold=0.8,
-        frame_rate=30
-    )
-
-    box_an = sv.BoxAnnotator(thickness=2)
+    # Annotators
+    tracker = sv.ByteTrack()
+    box_an = sv.BoxAnnotator(thickness=3)  # Thicker for presentation
     label_an = sv.LabelAnnotator(text_scale=0.6, text_color=sv.Color.BLACK)
-    trace_an = sv.TraceAnnotator(thickness=2, trace_length=30)  # Professional path tracing
 
     while True:
         ret, frame = cap.read()
@@ -140,16 +150,18 @@ def main():
             break
 
         h, w = frame.shape[:2]
+
+        # CALCULATE LINES (Updated to use the auto-calculated variable)
         door_y = int(h * line_door_pct)
         room_y = int(h * line_room_pct)
 
-        # Draw Lines
-        cv2.line(frame, (0, door_y), (w, door_y), (255, 255, 255), 2)
-        cv2.line(frame, (0, room_y), (w, room_y), (0, 255, 0), 2)
+        # Draw Lines (Thicker for visibility)
+        cv2.line(frame, (0, door_y), (w, door_y), (255, 255, 255), 3)
+        cv2.line(frame, (0, room_y), (w, room_y), (0, 255, 0), 3)
 
-        # Clean Labels
-        cv2.putText(frame, "OUTSIDE", (10, door_y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        cv2.putText(frame, "INSIDE", (10, room_y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        # Add Labels to the Video Feed
+        cv2.putText(frame, "DOOR ZONE", (10, door_y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(frame, "ROOM ZONE", (10, room_y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
         if run_ai:
             results = model(frame, verbose=False)[0]
@@ -157,14 +169,16 @@ def main():
             dets = tracker.update_with_detections(dets)
 
             current_states = {}
+            current_time = time.time()
 
             for i, (tid, cid) in enumerate(zip(dets.tracker_id, dets.class_id)):
+                # GUARD CLAUSE: Only Humans
                 if cid != 0: continue
 
                 bbox = dets.xyxy[i]
                 _, feet_y = get_feet_position(bbox)
 
-                # Zone Logic
+                # Determine Zone
                 if feet_y < door_y:
                     curr_pos = "OUTSIDE"
                 elif feet_y < room_y:
@@ -174,28 +188,39 @@ def main():
 
                 current_states[tid] = curr_pos
 
-                # Check Transitions
+                # LOGIC
                 prev_pos = st.session_state['tracker_state'].get(tid)
 
                 if prev_pos:
-                    # ENTRY
+                    # ENTRY LOGIC
                     if (prev_pos == "OUTSIDE" or prev_pos == "BETWEEN") and curr_pos == "INSIDE":
-                        st.session_state['count_in'] += 1
-                        st.session_state['recent_events'].insert(0, log_event("ENTRY", tid))
-                        in_metric.metric("Total Entered", st.session_state['count_in'])
-                        df = pd.DataFrame(st.session_state['recent_events'][:8])
-                        log_table.dataframe(df, hide_index=True, use_container_width=True)
-                        st.session_state['tracker_state'][tid] = "INSIDE"
+                        # CHECK COOLDOWN
+                        last_time = st.session_state['last_entry_time'].get(tid, 0)
+                        if current_time - last_time > COOLDOWN_SECONDS:
+                            st.session_state['count_in'] += 1
+                            st.session_state['recent_events'].insert(0, log_event("ENTRY", tid))
+                            st.session_state['last_entry_time'][tid] = current_time  # Set Timer
 
-                    # EXIT
+                            # Update UI
+                            in_metric.metric("Total Entered", st.session_state['count_in'])
+                            df = pd.DataFrame(st.session_state['recent_events'][:8])
+                            log_table.dataframe(df, hide_index=True, use_container_width=True)
+
+                    # EXIT LOGIC
                     elif (prev_pos == "INSIDE" or prev_pos == "BETWEEN") and curr_pos == "OUTSIDE":
-                        st.session_state['count_out'] += 1
-                        st.session_state['recent_events'].insert(0, log_event("EXIT", tid))
-                        out_metric.metric("Total Exited", st.session_state['count_out'])
-                        df = pd.DataFrame(st.session_state['recent_events'][:8])
-                        log_table.dataframe(df, hide_index=True, use_container_width=True)
-                        st.session_state['tracker_state'][tid] = "OUTSIDE"
+                        # CHECK COOLDOWN
+                        last_time = st.session_state['last_exit_time'].get(tid, 0)
+                        if current_time - last_time > COOLDOWN_SECONDS:
+                            st.session_state['count_out'] += 1
+                            st.session_state['recent_events'].insert(0, log_event("EXIT", tid))
+                            st.session_state['last_exit_time'][tid] = current_time  # Set Timer
 
+                            # Update UI
+                            out_metric.metric("Total Exited", st.session_state['count_out'])
+                            df = pd.DataFrame(st.session_state['recent_events'][:8])
+                            log_table.dataframe(df, hide_index=True, use_container_width=True)
+
+            # Update Memory
             st.session_state['tracker_state'].update(current_states)
 
             # Visuals
@@ -207,7 +232,6 @@ def main():
                 else:
                     labels.append(f"{object_name}")
 
-            frame = trace_an.annotate(frame, dets)
             frame = box_an.annotate(frame, dets)
             frame = label_an.annotate(frame, dets, labels=labels)
 
